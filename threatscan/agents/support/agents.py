@@ -15,6 +15,7 @@ import math
 import random
 import time
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,6 +23,9 @@ from ...core.agent_framework import (
     BaseAgent, AgentRole, Blackboard, EventBus,
     Finding, FindingSeverity
 )
+from ...config import settings
+from ...core.llm_client import llm
+from ...core.recon_tools import get_cisa_kev, is_in_kev, greynoise_ip_context, osv_lookup
 
 
 # ─────────────────────────────────────────────────────────
@@ -159,18 +163,53 @@ class ArchitectAgent(BaseAgent):
                 "recommendation": "Manual review required — no automated patch available for this vulnerability class"
             }
 
-        # Generate patch
-        patch = {
-            "finding_id": finding.id,
-            "vulnerability": finding.category,
-            "has_patch": True,
-            "language": template["language"],
-            "pattern_detected": template["pattern"],
-            "fix_approach": template["fix"],
-            "code_before": template["before"],
-            "code_after": template["after"],
-            "defense_in_depth": template["defense_in_depth"],
-        }
+        # Try LLM-powered patch generation first
+        llm_patch = None
+        if settings.has_llm:
+            try:
+                finding_dict = {
+                    "id": finding.id, "title": finding.title,
+                    "category": finding.category, "severity": finding.severity.value,
+                    "description": finding.description, "evidence": finding.evidence,
+                    "cwe_id": finding.cwe_id, "cvss_score": finding.cvss_score,
+                }
+                llm_patch = await llm.generate_patch(finding_dict)
+                if llm_patch:
+                    self.log(f"  LLM generated patch: {llm_patch.get('patch_summary', 'N/A')}")
+            except Exception as e:
+                self.log(f"  LLM patch generation failed: {e}", level="warning")
+
+        # Build patch — prefer LLM output, fall back to template
+        if llm_patch:
+            patch = {
+                "finding_id": finding.id,
+                "vulnerability": finding.category,
+                "has_patch": True,
+                "source": "llm",
+                "language": llm_patch.get("language", template.get("language", "unknown")),
+                "pattern_detected": llm_patch.get("vulnerable_pattern", template.get("pattern", "")),
+                "fix_approach": llm_patch.get("fix_approach", template.get("fix", "")),
+                "code_before": llm_patch.get("code_before", template.get("before", "") if template else ""),
+                "code_after": llm_patch.get("code_after", template.get("after", "") if template else ""),
+                "explanation": llm_patch.get("explanation", ""),
+                "test_case": llm_patch.get("test_case", ""),
+                "regression_risks": llm_patch.get("regression_risks", []),
+                "defense_in_depth": llm_patch.get("defense_in_depth",
+                    template.get("defense_in_depth", []) if template else []),
+            }
+        else:
+            patch = {
+                "finding_id": finding.id,
+                "vulnerability": finding.category,
+                "has_patch": True,
+                "source": "template",
+                "language": template["language"],
+                "pattern_detected": template["pattern"],
+                "fix_approach": template["fix"],
+                "code_before": template["before"],
+                "code_after": template["after"],
+                "defense_in_depth": template["defense_in_depth"],
+            }
 
         # Three-gate validation
         gates = await self._validate_patch(patch)
@@ -452,30 +491,66 @@ class HistorianAgent(BaseAgent):
         return {"bandit_updates": updates, "total_pulls": sum(self.bandit.pulls)}
 
     async def _correlate_threat_intel(self) -> dict:
-        """Cross-reference findings with external threat intelligence"""
+        """
+        Cross-reference findings with real external threat intelligence.
+        Uses CISA KEV feed (live or cached) when ENABLE_THREAT_INTEL=true.
+        Falls back to local known-vuln list otherwise.
+        """
         self.log("Correlating with external threat intelligence")
-
-        # Simulated threat intel feeds
-        active_threats = [
-            {"source": "CISA_KEV", "cve": "CVE-2021-44228", "name": "Log4Shell", "actively_exploited": True},
-            {"source": "CISA_KEV", "cve": "CVE-2022-22965", "name": "Spring4Shell", "actively_exploited": True},
-            {"source": "NVD", "cve": "CVE-2023-45857", "name": "Axios SSRF", "actively_exploited": False},
-            {"source": "DarkWeb", "indicator": "exploit_kit_v3", "targets": ["express", "fastapi"]},
-        ]
 
         vulnerable_deps = await self.blackboard.get_fact("vulnerable_dependencies") or []
         correlations = []
 
+        # Fetch CISA KEV (real or fallback)
+        try:
+            kev_list = await get_cisa_kev()
+            kev_cves = {v.get("cveID"): v for v in kev_list}
+            self.log(f"  CISA KEV loaded: {len(kev_cves)} entries")
+        except Exception as e:
+            self.log(f"  CISA KEV fetch error: {e}", level="warning")
+            kev_cves = {}
+
         for dep in vulnerable_deps:
-            for threat in active_threats:
-                if dep.get("cve") == threat.get("cve"):
-                    correlations.append({
-                        "dependency": dep["name"],
-                        "cve": dep["cve"],
-                        "threat_source": threat["source"],
-                        "actively_exploited": threat.get("actively_exploited", False),
-                        "urgency": "IMMEDIATE" if threat.get("actively_exploited") else "HIGH"
-                    })
+            cve_id = dep.get("cve", "")
+            if cve_id and cve_id in kev_cves:
+                kev_entry = kev_cves[cve_id]
+                correlations.append({
+                    "dependency": dep["name"],
+                    "cve": cve_id,
+                    "threat_source": "CISA_KEV",
+                    "actively_exploited": True,
+                    "urgency": "IMMEDIATE",
+                    "kev_name": kev_entry.get("vulnerabilityName", ""),
+                    "required_action": kev_entry.get("requiredAction", ""),
+                    "due_date": kev_entry.get("dueDate", ""),
+                })
+                self.log(f"  ⚠️  {cve_id} ({dep['name']}) is in CISA KEV!")
+            elif cve_id:
+                correlations.append({
+                    "dependency": dep["name"],
+                    "cve": cve_id,
+                    "threat_source": "local_db",
+                    "actively_exploited": False,
+                    "urgency": "HIGH",
+                })
+
+        # LLM-powered attack chain analysis on all findings
+        if settings.has_llm:
+            self.log("  Running LLM attack chain correlation")
+            try:
+                all_findings = await self.blackboard.get_findings()
+                findings_list = [
+                    {"id": f.id, "category": f.category, "severity": f.severity.value,
+                     "cvss_score": f.cvss_score, "title": f.title, "verified": f.verified}
+                    for f in all_findings[:25]
+                ]
+                chain_result = await llm.correlate_attack_chains(findings_list)
+                llm_chains = chain_result.get("attack_chains", []) if chain_result else []
+                if llm_chains:
+                    await self.blackboard.set_fact("llm_attack_chains", llm_chains, self.id)
+                    self.log(f"  LLM identified {len(llm_chains)} attack chains")
+            except Exception as e:
+                self.log(f"  LLM chain correlation failed: {e}", level="warning")
 
         self.threat_intel_cache = correlations
         await self.blackboard.set_fact("threat_correlations", correlations, self.id)
@@ -521,6 +596,38 @@ class HistorianAgent(BaseAgent):
             "threat_intel_correlations": correlations,
             "recommendations_priority": self._prioritize_recommendations(findings),
         }
+
+        # LLM executive summary
+        if settings.has_llm:
+            self.log("  Generating LLM executive summary")
+            try:
+                summary_data = {
+                    "target": await self.blackboard.get_fact("scan_target"),
+                    "risk_score": report["risk_score"],
+                    "summary": report["summary"],
+                    "top_findings": report["top_findings"][:5],
+                    "attack_chains": report.get("attack_chains", []),
+                    "threat_correlations": correlations[:5],
+                    "patches_generated": len(await self.blackboard.get_findings(verified_only=True)),
+                }
+                executive_summary = await llm.generate_executive_report(summary_data)
+                report["executive_summary"] = executive_summary
+                self.log("  Executive summary generated")
+            except Exception as e:
+                self.log(f"  Executive summary failed: {e}", level="warning")
+                report["executive_summary"] = "[Executive summary unavailable]"
+        else:
+            report["executive_summary"] = (
+                f"Risk Score: {report['risk_score']}/100. "
+                f"{report['summary']['total_findings']} findings identified "
+                f"({report['summary']['exploitable_findings']} exploitable). "
+                f"Configure ANTHROPIC_API_KEY for AI-powered narrative summary."
+            )
+
+        # Include LLM attack chains if available
+        llm_chains = await self.blackboard.get_fact("llm_attack_chains") or []
+        if llm_chains:
+            report["llm_attack_chains"] = llm_chains
 
         self.scan_report = report
         await self.blackboard.set_fact("scan_report", report, self.id)

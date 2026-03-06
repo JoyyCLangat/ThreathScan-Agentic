@@ -13,6 +13,7 @@ import sys
 # Fix imports for standalone execution
 sys.path.insert(0, "/home/claude")
 
+from threatscan.config import settings
 from threatscan.core.agent_framework import (
     Blackboard, EventBus, ScanTarget, AgentRole
 )
@@ -77,6 +78,7 @@ class ThreatScanHive:
         print(f"  THREATSCAN HIVE — Full Security Assessment")
         print(f"  Target: {target} ({target_type})")
         print(f"{'='*70}\n")
+        settings.print_status()
 
         # Initialize
         self._init_agents()
@@ -178,6 +180,12 @@ class ThreatScanHive:
         print(f"  Surface:   {summary.get('attack_surface_nodes', 0)} nodes mapped")
         print(f"  Intel:     {summary.get('threat_correlations', 0)} threat correlations")
         print(f"  Patches:   {len(patches)} generated ({gates_passed} validated)")
+
+        if report.get("executive_summary"):
+            print(f"\n  Executive Summary:")
+            print(f"  {'─'*64}")
+            for line in report["executive_summary"].split('\n')[:12]:
+                print(f"  {line}")
 
         if report.get("recommendations_priority"):
             print(f"\n  Priority Remediation:")
