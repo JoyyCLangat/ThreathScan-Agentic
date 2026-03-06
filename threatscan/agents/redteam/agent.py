@@ -23,6 +23,8 @@ from ...core.agent_framework import (
     BaseAgent, AgentRole, Blackboard, EventBus,
     Finding, FindingSeverity
 )
+from ...config import settings
+from ...core.llm_client import llm
 
 
 # ─────────────────────────────────────────────────────────
@@ -524,29 +526,64 @@ class RedTeamAgent(BaseAgent):
     async def _verify_finding(self, finding: Finding) -> dict:
         """
         Full verification pipeline for a single finding:
-          1. ToT exploit planning
-          2. Sandboxed execution of top strategies
-          3. Evasion scoring
-          4. PoC generation
+          1. LLM-powered ToT exploit reasoning (when API key available)
+          2. Heuristic ToT exploit planning (always runs as baseline)
+          3. Sandboxed execution of top strategies
+          4. Evasion scoring
+          5. PoC generation
         """
         self.log(f"Verifying finding: {finding.id} ({finding.category})")
 
-        # Step 1: Tree-of-Thought exploit planning
         context = {
             "tech_stack": await self.blackboard.get_fact("detected_framework"),
             "waf_present": await self.blackboard.get_fact("waf_detected") or False,
+            "endpoints": len(await self.blackboard.get_fact("discovered_endpoints") or []),
         }
 
+        # Step 1: LLM-powered exploit reasoning (when available)
+        llm_strategies = []
+        if settings.has_llm:
+            self.log(f"  Requesting LLM exploit synthesis for {finding.category}")
+            try:
+                finding_dict = {
+                    "id": finding.id, "title": finding.title,
+                    "category": finding.category, "severity": finding.severity.value,
+                    "cvss_score": finding.cvss_score, "description": finding.description,
+                    "evidence": finding.evidence, "asset": finding.asset,
+                }
+                llm_result = await llm.synthesize_exploit(finding_dict, context)
+                if llm_result and llm_result.get("strategies"):
+                    for s in llm_result["strategies"]:
+                        node = ThoughtNode(
+                            id=f"LLM-{hashlib.md5(s.get('name','').encode()).hexdigest()[:6]}",
+                            strategy=f"[LLM] {s.get('name', 'Unknown')}",
+                            technique=finding.category,
+                            payload=s.get("payload_template", ""),
+                            score=float(s.get("success_probability", 0.5)),
+                            evasion_score=float(s.get("evasion_difficulty", 0.5)),
+                        )
+                        llm_strategies.append(node)
+                    self.log(f"  LLM synthesized {len(llm_strategies)} strategies "
+                             f"(exploitability: {llm_result.get('overall_exploitability', 'unknown')})")
+            except Exception as e:
+                self.log(f"  LLM exploit synthesis failed: {e}", level="warning")
+
+        # Step 2: Heuristic ToT planning (baseline, always runs)
         strategies = self.tot_planner.plan(finding.category, context)
 
-        if not strategies:
+        # Merge LLM + heuristic strategies, LLM ones first (higher quality)
+        all_strategies = llm_strategies + strategies
+        if not all_strategies:
             self.log(f"  No exploit strategies for {finding.category}")
             return {"verified": False, "reason": "no_strategies"}
 
-        self.log(f"  ToT generated {len(strategies)} strategies "
-                 f"(explored: {self.tot_planner.nodes_explored}, pruned: {self.tot_planner.nodes_pruned})")
+        self.log(f"  Total strategies: {len(all_strategies)} "
+                 f"({len(llm_strategies)} LLM + {len(strategies)} heuristic, "
+                 f"explored: {self.tot_planner.nodes_explored}, pruned: {self.tot_planner.nodes_pruned})")
 
-        # Step 2: Execute top strategies in sandbox
+        strategies = all_strategies  # use merged list below
+
+        # Step 3: Execute top strategies in sandbox
         successful_exploits = []
         for strategy in strategies[:5]:  # test top 5
             trace = await self.sandbox.execute(strategy.payload, context)

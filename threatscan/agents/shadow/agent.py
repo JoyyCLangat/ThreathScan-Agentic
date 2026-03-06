@@ -11,22 +11,33 @@ Key Algorithms:
   - Dependency graph construction with transitive vuln detection
   - PID-controlled adaptive scan timing (IDS evasion)
   - Attack Surface Graph construction
+
+Real integrations (activated via .env):
+  - ENABLE_REAL_HTTP_PROBING=true  → actual httpx HTTP probing
+  - ANTHROPIC_API_KEY              → LLM-powered tech fingerprinting + JS analysis
+  - SHODAN_API_KEY                 → Shodan host enrichment
+  - NVD_API_KEY                    → live CVE lookups for dependencies
 """
 
 import asyncio
 import hashlib
+import json
 import re
 import time
 import random
 import math
+import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, urljoin
 from typing import Optional
 
 from ...core.agent_framework import (
     BaseAgent, AgentRole, Blackboard, EventBus,
-    AttackSurfaceNode, FindingSeverity
+    AttackSurfaceNode, FindingSeverity, Finding
 )
+from ...config import settings
+from ...core.llm_client import llm
 
 
 # ─────────────────────────────────────────────────────────
@@ -353,14 +364,21 @@ class ShadowAgent(BaseAgent):
     async def _run_passive_osint(self, target_value: str) -> dict:
         """
         Passive reconnaissance — no direct contact with target.
-        Certificate transparency, DNS records, WHOIS.
+        Certificate transparency (crt.sh), DNS records, WHOIS.
+
+        When ENABLE_REAL_HTTP_PROBING=true, queries the live crt.sh API.
+        Falls back to simulation otherwise.
         """
         self.log("Phase: Passive OSINT — CT logs, DNS, WHOIS")
         parsed = urlparse(target_value if "://" in target_value else f"https://{target_value}")
         domain = parsed.hostname or target_value
 
-        # Simulate CT log query (in production: query crt.sh API)
-        subdomains = self._enumerate_subdomains(domain)
+        if settings.enable_real_http_probing:
+            subdomains = await self._real_ct_log_query(domain)
+            self.log(f"  [REAL] crt.sh returned {len(subdomains)} subdomains")
+        else:
+            subdomains = self._enumerate_subdomains(domain)
+
         dns_records = self._enumerate_dns(domain)
 
         for sub in subdomains:
@@ -379,59 +397,152 @@ class ShadowAgent(BaseAgent):
 
         return {"subdomains": len(subdomains), "dns_records": len(dns_records)}
 
+    async def _real_ct_log_query(self, domain: str) -> list[str]:
+        """Query crt.sh for certificate transparency log subdomains."""
+        try:
+            url = f"{settings.ct_log_url}/?q=%.{urllib.parse.quote(domain)}&output=json"
+            loop = asyncio.get_event_loop()
+
+            def _fetch():
+                req = urllib.request.Request(url, headers={"User-Agent": settings.http_user_agent})
+                with urllib.request.urlopen(req, timeout=settings.http_probe_timeout) as resp:
+                    return json.loads(resp.read().decode())
+
+            data = await loop.run_in_executor(None, _fetch)
+            subs = set()
+            for entry in data:
+                name = entry.get("name_value", "")
+                for sub in name.split("\n"):
+                    sub = sub.strip().lstrip("*.")
+                    if sub and domain in sub and sub != domain:
+                        subs.add(sub)
+            return list(subs)[:30]  # cap at 30
+        except Exception as e:
+            self.log(f"  crt.sh query failed ({e}), falling back to simulation", "warning")
+            return self._enumerate_subdomains(domain)
+
     async def _run_tech_fingerprint(self, target_value: str) -> dict:
         """
         Technology fingerprinting via HTTP headers, response patterns,
-        and favicon hash matching.
+        favicon hash matching, and optional LLM-powered interpretation.
+
+        When ENABLE_REAL_HTTP_PROBING=true: sends a real HEAD/GET request.
+        When ANTHROPIC_API_KEY set: uses LLM to interpret ambiguous signals.
         """
         self.log("Phase: Technology Fingerprinting")
-
-        # Simulate HTTP response analysis
         detected_tech = []
 
-        # Header-based detection (simulated)
-        simulated_headers = {
-            "Server": "nginx/1.24.0",
-            "X-Powered-By": "Express",
-            "X-Request-Id": "uuid-format",
-            "Content-Type": "application/json",
-        }
+        if settings.enable_real_http_probing:
+            headers_dict = await self._real_http_head(target_value)
+            self.log(f"  [REAL] Got {len(headers_dict)} response headers")
+        else:
+            headers_dict = {
+                "Server": "nginx/1.24.0",
+                "X-Powered-By": "Express",
+                "X-Request-Id": "uuid-format",
+                "Content-Type": "application/json",
+            }
 
-        for header, value in simulated_headers.items():
+        # Header-based detection
+        for header, value in headers_dict.items():
             if header in TECH_FINGERPRINTS:
                 for pattern, tech_info in TECH_FINGERPRINTS[header].items():
                     if pattern == "__present__" or pattern.lower() in value.lower():
                         detected_tech.append(tech_info)
                         await self.emit("recon.tech_discovered", tech_info)
                         await self.blackboard.set_fact(
-                            f"tech.{tech_info.get('name', 'unknown')}",
-                            tech_info, self.id
+                            f"tech.{tech_info.get('name', 'unknown')}", tech_info, self.id
                         )
 
-        # Favicon hash fingerprinting (MMH3)
+        # LLM-powered interpretation of unusual or combined signals
+        if settings.has_llm and headers_dict:
+            llm_tech = await self._llm_fingerprint(target_value, headers_dict)
+            if llm_tech:
+                detected_tech.extend(llm_tech)
+                self.log(f"  [LLM] Identified {len(llm_tech)} additional tech signals")
+
         favicon_hash = self._compute_favicon_hash(b"simulated_favicon_bytes")
         self.log(f"Favicon MMH3 hash: {favicon_hash}")
 
-        # Determine framework for MCMC sampler
         framework = "generic"
         for tech in detected_tech:
             name = tech.get("name", "").lower()
-            if "express" in name:
-                framework = "express"
-            elif "flask" in name or "uvicorn" in name or "gunicorn" in name:
-                framework = "fastapi"
-            elif "rails" in name:
-                framework = "rails"
-            elif "django" in name:
-                framework = "django"
-            elif "spring" in name:
-                framework = "spring"
+            if "express" in name: framework = "express"
+            elif "flask" in name or "uvicorn" in name or "gunicorn" in name: framework = "fastapi"
+            elif "rails" in name: framework = "rails"
+            elif "django" in name: framework = "django"
+            elif "spring" in name: framework = "spring"
 
         self.mcmc_sampler = MCMCPathSampler(framework=framework)
         await self.blackboard.set_fact("detected_framework", framework, self.id)
+        await self.blackboard.set_fact("response_headers", headers_dict, self.id)
         self.discovered_tech = detected_tech
 
         return {"technologies": detected_tech, "framework": framework}
+
+    async def _real_http_head(self, target_value: str) -> dict:
+        """Send a real HEAD (then GET fallback) request and return response headers."""
+        url = target_value if "://" in target_value else f"https://{target_value}"
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            req = urllib.request.Request(
+                url,
+                method="HEAD",
+                headers={"User-Agent": settings.http_user_agent}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=settings.http_probe_timeout) as resp:
+                    return dict(resp.headers)
+            except Exception:
+                # Some servers reject HEAD; try GET
+                req2 = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": settings.http_user_agent}
+                )
+                with urllib.request.urlopen(req2, timeout=settings.http_probe_timeout) as resp:
+                    return dict(resp.headers)
+
+        try:
+            return await loop.run_in_executor(None, _fetch)
+        except Exception as e:
+            self.log(f"  HTTP HEAD failed ({e})", "warning")
+            return {}
+
+    async def _llm_fingerprint(self, target: str, headers: dict) -> list[dict]:
+        """Use Claude to identify technologies from headers + response patterns."""
+        prompt = f"""
+Analyze these HTTP response headers from {target} and identify all detectable technologies,
+frameworks, infrastructure, and security configurations.
+
+Headers:
+{json.dumps(headers, indent=2)}
+
+Return a JSON array of technology objects. Each object must have:
+  - name: string (e.g. "Nginx", "React", "AWS CloudFront")
+  - type: one of "framework", "runtime", "server", "cdn", "database", "auth", "infra"
+  - ecosystem: one of "node", "python", "java", "php", "ruby", "dotnet", "infra", "unknown"
+  - confidence: float 0.0-1.0
+  - security_notes: string (any security-relevant observations, or "")
+
+Return ONLY the JSON array, no explanation.
+"""
+        import json as _json
+        result_str = await llm.complete(
+            system="You are a senior security researcher. Respond ONLY with valid JSON, no markdown, no preamble.",
+            user=prompt,
+            fast=True,
+        )
+        if not result_str:
+            return []
+        try:
+            clean = result_str.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            result = _json.loads(clean)
+            if isinstance(result, list):
+                return [r for r in result if isinstance(r, dict) and "name" in r]
+        except Exception:
+            pass
+        return []
 
     async def _run_endpoint_discovery(self, target_value: str) -> dict:
         """
@@ -449,13 +560,23 @@ class ShadowAgent(BaseAgent):
                  f"(rejection rate: {self.mcmc_sampler.rejection_count})")
 
         discovered = []
-        for path in candidates:
-            # Simulate probing with adaptive timing
-            latency = random.gauss(150, 50)  # simulated response time
-            delay = self.scan_timer.update(latency)
+        base_url = (target_value if "://" in target_value
+                   else f"https://{target_value}") if hasattr(self, '_current_target') else ""
 
-            # Simulate response (in production: actual HTTP request)
-            status_code = self._simulate_probe(path)
+        # Use real HTTP probing or simulation based on settings
+        probe_fn = http_probe if settings.enable_real_http_probing else None
+
+        for path in candidates:
+            if probe_fn and base_url:
+                probe_url = base_url.rstrip("/") + path
+                result = await probe_fn(probe_url)
+                status_code = result.get("status", 0)
+                latency = result.get("latency_ms", 150.0)
+            else:
+                latency = random.gauss(150, 50)
+                status_code = self._simulate_probe(path)
+
+            delay = self.scan_timer.update(latency)
 
             if status_code in (200, 301, 302, 401, 403):
                 endpoint = {
@@ -463,6 +584,7 @@ class ShadowAgent(BaseAgent):
                     "status": status_code,
                     "latency_ms": latency,
                     "requires_auth": status_code in (401, 403),
+                    "real_probe": settings.enable_real_http_probing,
                 }
                 discovered.append(endpoint)
 
@@ -475,7 +597,7 @@ class ShadowAgent(BaseAgent):
                 self.attack_surface_nodes.append(node)
                 await self.blackboard.add_attack_surface_node(node)
 
-            await asyncio.sleep(max(delay * 0.01, 0.001))  # scaled for simulation
+            await asyncio.sleep(max(delay * 0.01, 0.001))
 
         self.discovered_endpoints = discovered
         await self.blackboard.set_fact("discovered_endpoints", discovered, self.id)
@@ -487,38 +609,60 @@ class ShadowAgent(BaseAgent):
 
     async def _run_dependency_audit(self, target_value: str) -> dict:
         """
-        Build dependency tree and cross-reference against NVD/OSV/Snyk.
-        Uses semantic versioning range matching for transitive vuln detection.
+        Build dependency tree and cross-reference against NVD/OSV.
+
+        When NVD_API_KEY or OSV_API_URL is set, performs live CVE lookups.
+        Falls back to local pattern matching otherwise.
         """
         self.log("Phase: Dependency Audit")
 
-        # Simulate dependency tree (in production: parse package.json, requirements.txt, pom.xml)
         simulated_deps = [
-            {"name": "express", "version": "4.18.2", "depth": 0},
-            {"name": "jsonwebtoken", "version": "9.0.0", "depth": 0},
-            {"name": "lodash", "version": "4.17.20", "depth": 1},
-            {"name": "axios", "version": "1.4.0", "depth": 1},
-            {"name": "body-parser", "version": "1.20.2", "depth": 0},
-            {"name": "mongoose", "version": "7.3.1", "depth": 0},
-            {"name": "helmet", "version": "7.0.0", "depth": 0},
+            {"name": "express", "version": "4.18.2", "ecosystem": "npm", "depth": 0},
+            {"name": "jsonwebtoken", "version": "9.0.0", "ecosystem": "npm", "depth": 0},
+            {"name": "lodash", "version": "4.17.20", "ecosystem": "npm", "depth": 1},
+            {"name": "axios", "version": "1.4.0", "ecosystem": "npm", "depth": 1},
+            {"name": "body-parser", "version": "1.20.2", "ecosystem": "npm", "depth": 0},
+            {"name": "mongoose", "version": "7.3.1", "ecosystem": "npm", "depth": 0},
+            {"name": "helmet", "version": "7.0.0", "ecosystem": "npm", "depth": 0},
         ]
 
         vulnerable_deps = []
+
         for dep in simulated_deps:
-            if dep["name"] in VULN_DEPENDENCY_PATTERNS:
-                vuln = VULN_DEPENDENCY_PATTERNS[dep["name"]]
+            # Try live OSV lookup first
+            osv_vulns = await self._osv_lookup(dep["name"], dep["version"], dep["ecosystem"])
+            if osv_vulns:
+                for vuln in osv_vulns:
+                    vulnerable_deps.append({
+                        **dep,
+                        "vulnerability": vuln.get("id", "UNKNOWN"),
+                        "cve": vuln.get("aliases", [vuln.get("id", "")])[0],
+                        "severity": vuln.get("severity", "medium"),
+                        "source": "osv.dev",
+                    })
+                    node = AttackSurfaceNode(
+                        node_type="vulnerable_dependency",
+                        name=f"{dep['name']}@{dep['version']}",
+                        properties={"id": vuln.get("id"), "source": "osv.dev"},
+                        risk_score=0.7
+                    )
+                    self.attack_surface_nodes.append(node)
+                    await self.blackboard.add_attack_surface_node(node)
+            elif dep["name"] in VULN_DEPENDENCY_PATTERNS:
+                # Fallback to local patterns
+                vuln_info = VULN_DEPENDENCY_PATTERNS[dep["name"]]
                 vulnerable_deps.append({
                     **dep,
-                    "vulnerability": vuln.get("name", vuln.get("cve")),
-                    "cve": vuln["cve"],
-                    "severity": vuln["severity"].value,
+                    "vulnerability": vuln_info.get("name", vuln_info.get("cve")),
+                    "cve": vuln_info["cve"],
+                    "severity": vuln_info["severity"].value,
+                    "source": "local_patterns",
                 })
-
                 node = AttackSurfaceNode(
                     node_type="vulnerable_dependency",
                     name=f"{dep['name']}@{dep['version']}",
-                    properties={"cve": vuln["cve"], "severity": vuln["severity"].value},
-                    risk_score=vuln["severity"].numeric / 10.0
+                    properties={"cve": vuln_info["cve"], "severity": vuln_info["severity"].value},
+                    risk_score=vuln_info["severity"].numeric / 10.0
                 )
                 self.attack_surface_nodes.append(node)
                 await self.blackboard.add_attack_surface_node(node)
@@ -527,7 +671,38 @@ class ShadowAgent(BaseAgent):
         await self.blackboard.set_fact("dependencies", simulated_deps, self.id)
         await self.blackboard.set_fact("vulnerable_dependencies", vulnerable_deps, self.id)
 
+        self.log(f"  Deps audited: {len(simulated_deps)}, vulnerable: {len(vulnerable_deps)}")
         return {"total_deps": len(simulated_deps), "vulnerable": len(vulnerable_deps)}
+
+    async def _osv_lookup(self, name: str, version: str, ecosystem: str) -> list[dict]:
+        """Query osv.dev API for known vulnerabilities in a package version."""
+        if not settings.enable_threat_intel:
+            return []
+        try:
+            ecosystem_map = {"npm": "npm", "pip": "PyPI", "maven": "Maven", "gem": "RubyGems"}
+            osv_ecosystem = ecosystem_map.get(ecosystem, ecosystem)
+            payload = json.dumps({
+                "package": {"name": name, "ecosystem": osv_ecosystem},
+                "version": version
+            }).encode()
+
+            loop = asyncio.get_event_loop()
+
+            def _fetch():
+                req = urllib.request.Request(
+                    f"{settings.osv_api_url}/v1/query",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=settings.http_probe_timeout) as resp:
+                    return json.loads(resp.read().decode())
+
+            data = await loop.run_in_executor(None, _fetch)
+            return data.get("vulns", [])
+        except Exception as e:
+            self.log(f"  OSV lookup failed for {name}@{version}: {e}", "debug")
+            return []
 
     async def _run_js_analysis(self, target_value: str) -> dict:
         """
