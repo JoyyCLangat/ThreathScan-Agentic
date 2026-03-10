@@ -531,7 +531,6 @@ Return ONLY the JSON array, no explanation.
         result_str = await llm.complete(
             system="You are a senior security researcher. Respond ONLY with valid JSON, no markdown, no preamble.",
             user=prompt,
-            fast=True,
         )
         if not result_str:
             return []
