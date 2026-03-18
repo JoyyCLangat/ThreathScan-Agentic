@@ -181,7 +181,6 @@ WAF_SIGNATURES = {
     "command_patterns": ["|", ";", "`", "$(", "%0a"],
 }
 
-
 # ─────────────────────────────────────────────────────────
 # Tree-of-Thought Exploit Planner
 # ─────────────────────────────────────────────────────────
@@ -325,7 +324,6 @@ class TreeOfThoughtPlanner:
 
         return variants
 
-
 # ─────────────────────────────────────────────────────────
 # Sandbox Execution Environment
 # ─────────────────────────────────────────────────────────
@@ -343,7 +341,6 @@ class ExecutionTrace:
     memory_events: list = field(default_factory=list)
     response: dict = field(default_factory=dict)
     error: Optional[str] = None
-
 
 class SandboxExecutor:
     """
