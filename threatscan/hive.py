@@ -159,10 +159,12 @@ class ThreatScanHive:
         self.scan_end_time = time.time()
         duration = self.scan_end_time - self.scan_start_time
 
+        
         # ── Final Summary ──
         summary = report.get("summary", {})
         risk = report.get("risk_score", 0)
 
+        
         print(f"\n{'='*70}")
         print(f"  SCAN COMPLETE — {duration:.1f}s")
         print(f"{'='*70}")
