@@ -11,7 +11,6 @@ Key Algorithms:
   - MITRE ATT&CK-informed attack phase modeling
 """
 
-
 import asyncio
 import time
 import math
@@ -97,7 +96,6 @@ TACTICAL_PHASES = [
         ]
     }
 ]
-
 
 # ─────────────────────────────────────────────────────────
 # TOPSIS Multi-Criteria Decision Analysis
