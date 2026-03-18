@@ -42,7 +42,6 @@ def _int(key: str, default: int) -> int:
     except (ValueError, TypeError):
         return default
 
-
 def _str(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
@@ -52,7 +51,6 @@ def _list(key: str, default: list = None) -> list:
     if not raw:
         return default or []
     return [x.strip() for x in raw.split(",") if x.strip()]
-
 
 @dataclass
 class Settings:
