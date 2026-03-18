@@ -131,11 +131,13 @@ class Settings:
             and key != "your_anthropic_api_key_here"
         )
 
+    
     @property
     def has_shodan(self) -> bool:
         key = self.shodan_api_key or ""
         return bool(key) and key != "your_shodan_api_key_here"
 
+    
     @property
     def has_virustotal(self) -> bool:
         key = self.virustotal_api_key or ""
