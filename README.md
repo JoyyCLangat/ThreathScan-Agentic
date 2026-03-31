@@ -286,7 +286,9 @@ Takes the Attack Surface Graph and individual findings, then predicts multi-step
 
 A chain is flagged when ≥50% of its links are present in the findings. Confidence is proportional to match ratio.
 
+
 ---
+
 
 ### 4. Red Team (Adversarial Verification) — `agents/redteam/agent.py` (657 lines)
 
