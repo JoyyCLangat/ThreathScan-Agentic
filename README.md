@@ -488,6 +488,7 @@ This runs the full pipeline against a simulated target (`https://api.example-fin
   ✓ Risk Score: 87.3/100
 ```
 
+
 ### Programmatic Usage
 
 ```python
@@ -622,7 +623,9 @@ Add entries to the Red Team's knowledge base in `EXPLOIT_KNOWLEDGE_BASE` with te
 - [ ] **WebSocket dashboard** — Real-time scan progress streaming to frontend
 - [ ] **Multi-target campaigns** — Scan multiple assets with shared intelligence
 
+
 ---
+
 
 ## License
 
