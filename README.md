@@ -217,6 +217,7 @@ request.params, request.body, request.headers, request.query,
 request.cookies, request.files, process.env, sys.argv, input()
 ```
 
+
 Known sinks (dangerous operations):
 ```
 cursor.execute (SQLi), eval/exec (code injection), os.system (command injection),
@@ -229,6 +230,7 @@ Known sanitizers (neutralize taint):
 escape_html, DOMPurify.sanitize, parameterize, bleach.clean,
 encodeURIComponent, html.escape, validator.escape
 ```
+
 
 If tainted data reaches a sink without passing through a sanitizer, a finding is generated with the severity of the sink type.
 
