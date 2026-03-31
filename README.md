@@ -75,7 +75,9 @@ All agents communicate through two mechanisms:
 
 **EventBus** — A pub/sub system for real-time coordination. Agents subscribe to event types (`finding.critical`, `recon.tech_discovered`, `agent.error`) and react asynchronously. The Commander subscribes to critical finding events to trigger adaptive re-planning.
 
+
 ---
+
 
 ## The OODA Cognitive Loop
 
