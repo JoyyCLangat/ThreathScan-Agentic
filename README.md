@@ -24,7 +24,9 @@ The agents don't just run a checklist. They **plan**, **adapt**, **reason**, and
 - The **Architect** generates validated patches with three-gate verification and systemic root cause analysis
 - The **Historian** records everything, updates reinforcement learning models, and correlates with external threat intelligence
 
+
 ---
+
 
 ## Architecture
 
